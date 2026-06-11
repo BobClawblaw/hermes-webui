@@ -2520,7 +2520,22 @@ def _resolve_compatible_session_model_state(
             and model_prefix == "openai"
         )
         if not explicit_provider and not stale_codex_openai_slash_id:
-            return model, requested_provider, False
+            # Only use the session's persisted provider if the model is actually
+            # available under it. When a session outlives a provider change the
+            # stale provider must not be preserved — fall through to the slow
+            # path which resolves against the active provider.
+            model_is_available_under_requested = False
+            try:
+                catalog = get_available_models(prefer_cache=True)
+                for g in catalog.get("groups") or []:
+                    if g.get("provider_id") == requested_provider:
+                        if any(m.get("id") == model for m in g.get("models") or []):
+                            model_is_available_under_requested = True
+                            break
+            except Exception:
+                pass
+            if model_is_available_under_requested:
+                return model, requested_provider, False
 
     # Default (human chat/start) path calls get_available_models() with NO
     # kwargs so it stays signature-compatible with the many tests that stub
@@ -2767,6 +2782,28 @@ def _resolve_compatible_session_model_state(
     if active_provider in {"custom", "openrouter"}:
         # These namespaces are always routable as-is — preserve them.
         if model_provider in {"", "custom", "openrouter"}:
+            # Model has no provider prefix. Only preserve the session's
+            # requested_provider if the model is actually available under it,
+            # or if it matches the active provider. When the active provider
+            # is custom/custom-providers and the model exists under that
+            # provider, prefer the active provider over a stale session
+            # provider (fixes stale openai-api sessions when custom is active).
+            if requested_provider and requested_provider != active_provider:
+                # Check if model exists under active provider
+                groups = catalog.get("groups") or []
+                for g in groups:
+                    if g.get("provider_id") == requested_provider:
+                        for m in g.get("models") or []:
+                            if m.get("id") == model:
+                                return model, requested_provider, False
+                # Model not under requested_provider — use active provider
+                active_provider_id = catalog.get("active_provider") or ""
+                for g in groups:
+                    if g.get("provider_id") == active_provider_id:
+                        for m in g.get("models") or []:
+                            if m.get("id") == model:
+                                return model, active_provider_id, False
+                return model, requested_provider, False
             return model, requested_provider, False
         # Check if any catalog group can actually route this model's prefix.
         groups = catalog.get("groups") or []
