@@ -64,16 +64,32 @@ def _provider_env_var_for(provider_id: str) -> str | None:
 
 
 def _custom_provider_name_matches(provider_id: str, name: object) -> bool:
-    """Return True when *provider_id* refers to a named custom provider."""
+    """Return True when *provider_id* refers to a named custom provider.
+
+    Normalizes *provider_id* through ``_custom_provider_slug_from_name`` so
+    that both colon-bearing (``custom:192.168.5.242:8000``) and hyphenated
+    (``custom:192.168.5.242-8000``) forms match a custom provider entry whose
+    name slugifies to the same string (#6516).
+    """
     pid = str(provider_id or "").strip().lower()
     raw_name = str(name or "").strip().lower()
     if not pid or not raw_name:
         return False
+    # Normalise pid through the shared slug helper so both colon-bearing
+    # and hyphenated forms match consistently.
     slug = _custom_provider_slug_from_name(raw_name)
+    pid_normalised = _custom_provider_slug_from_name(pid) or pid
     candidates = {raw_name, f"custom:{raw_name}"}
     if slug:
         candidates.add(slug)
-    return pid in candidates
+        candidates.add(slug.removeprefix("custom:"))
+    # Also try the pid's own slugified form (handles the case where
+    # provider_id is "custom:192.168.5.242:8000" and the slug is
+    # "custom:192.168.5.242-8000").
+    if pid_normalised:
+        candidates.add(pid_normalised)
+        candidates.add(pid_normalised.removeprefix("custom:"))
+    return pid in candidates or pid_normalised in candidates
 
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 _PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0
