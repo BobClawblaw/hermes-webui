@@ -78,18 +78,17 @@ def _custom_provider_name_matches(provider_id: str, name: object) -> bool:
     # Normalise pid through the shared slug helper so both colon-bearing
     # and hyphenated forms match consistently.
     slug = _custom_provider_slug_from_name(raw_name)
-    pid_normalised = _custom_provider_slug_from_name(pid) or pid
     candidates = {raw_name, f"custom:{raw_name}"}
     if slug:
         candidates.add(slug)
-        candidates.add(slug.removeprefix("custom:"))
-    # Also try the pid's own slugified form (handles the case where
-    # provider_id is "custom:192.168.5.242:8000" and the slug is
-    # "custom:192.168.5.242-8000").
-    if pid_normalised:
-        candidates.add(pid_normalised)
-        candidates.add(pid_normalised.removeprefix("custom:"))
-    return pid in candidates or pid_normalised in candidates
+    # When the provider_id starts with "custom:", normalise it through
+    # the slugger so that ``custom:host:8000`` and ``custom:host-8000``
+    # match the same entry.
+    if pid.startswith("custom:"):
+        pid_normalised = _custom_provider_slug_from_name(pid) or pid
+        if pid_normalised:
+            candidates.add(pid_normalised)
+    return pid in candidates
 
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 _PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0
