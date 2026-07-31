@@ -465,10 +465,22 @@ def _resolve_custom_provider_runtime_overrides(
     _cp_key, _cp_base = resolve_custom_provider_connection(
         resolved_provider, config_data=config_data,
     )
-    if not resolved_api_key and _cp_key:
-        resolved_api_key = _cp_key
-    if not resolved_base_url and _cp_base:
-        resolved_base_url = _cp_base
+    if config_data is not None:
+        # Target-profile scope is authoritative: the uniquely selected
+        # target-profile URL/key must override any conflicting truthy
+        # runtime values that may have been resolved from the ambient
+        # process-global config (#6516 round-4).  Only fall back to the
+        # incoming runtime values when the target profile did not supply
+        # a concrete URL/key.
+        if _cp_key:
+            resolved_api_key = _cp_key
+        if _cp_base:
+            resolved_base_url = _cp_base
+    else:
+        if not resolved_api_key and _cp_key:
+            resolved_api_key = _cp_key
+        if not resolved_base_url and _cp_base:
+            resolved_base_url = _cp_base
     if resolved_base_url:
         # Route through the generic custom OpenAI-compatible client once the
         # named provider has supplied the concrete endpoint. Keeping the
@@ -8521,11 +8533,24 @@ def _run_agent_streaming(
             # instead of the ambient process-global config (#6516 gate finding).
             from api.config import get_config_for_profile_home as _get_config_for_home
             _custom_provider_identity = None
+            # Determine if we have a custom:slug provider that needs
+            # target-profile credential resolution.
+            _is_custom_provider = (
+                isinstance(resolved_provider, str)
+                and resolved_provider.startswith("custom:")
+            )
             try:
                 _cfg = _get_config_for_home(_profile_home)
             except Exception:
-                from api.config import get_config as _get_config
-                _cfg = _get_config()
+                if _is_custom_provider:
+                    # Fail closed: do not fall back to ambient get_config()
+                    # for custom:slug providers when the target profile cannot
+                    # be loaded — that would leak the wrong profile's URL/key
+                    # (#6516 round-4).
+                    _cfg = {}
+                else:
+                    from api.config import get_config as _get_config
+                    _cfg = _get_config()
 
             # Named custom providers (custom:slug) may not be resolvable by
             # hermes_cli.runtime_provider directly. Fall back to config.yaml

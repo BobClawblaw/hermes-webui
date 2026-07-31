@@ -2597,6 +2597,28 @@ def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
     return bare_model, provider_hint
 
 
+def _canonicalize_custom_provider_id(raw: str) -> str:
+    """Canonicalize a provider_id through the shared named-custom slug path.
+
+    For ``custom:*`` IDs, the suffix is run through
+    ``_custom_provider_slug_from_name`` so that ``custom:foo:bar`` and
+    ``custom:foo-bar`` both canonicalize to ``custom:foo-bar``.  Non-custom
+    IDs are returned lowercased as-is.  Returns empty string for falsy input.
+    """
+    raw = str(raw or "").strip().lower()
+    if not raw:
+        return ""
+    if raw.startswith("custom:"):
+        suffix = raw.split(":", 1)[1].strip()
+        if not suffix:
+            return raw
+        slug = _custom_provider_slug_from_name(suffix)
+        if slug:
+            return slug
+        return raw
+    return raw
+
+
 def _get_provider_base_url(provider_id):
     """Look up the configured base_url for a provider (e.g. lmstudio).
 
@@ -2625,11 +2647,19 @@ def _get_provider_base_url(provider_id):
     # the custom_providers list scan so that a lossy-slug collision in
     # custom_providers[] does not shadow the model section's URL for the
     # active provider (#6516 gate finding).
+    #
+    # Canonicalize both the requested provider_id and the model.provider
+    # through the shared named-custom slug path before comparing.  Without
+    # this, custom:foo:bar (active model) would not match custom:foo-bar
+    # (requested route) even though they slugify to the same canonical slug
+    # — the trusted active-model URL would be ignored (#6516 round-4).
     pid_lower = str(provider_id or "").strip().lower()
+    pid_canonical = _canonicalize_custom_provider_id(pid_lower)
     model_cfg = cfg.get("model", {}) or {}
     if isinstance(model_cfg, dict):
         model_provider = str(model_cfg.get("provider") or "").strip().lower()
-        if model_provider == pid_lower:
+        mp_canonical = _canonicalize_custom_provider_id(model_provider)
+        if mp_canonical and mp_canonical == pid_canonical:
             model_base = (model_cfg.get("base_url") or "").strip().rstrip("/")
             if model_base:
                 return model_base
@@ -3142,7 +3172,10 @@ def _resolve_custom_provider_ambiguous(
         model_cfg = cfg_data.get("model", {})
         if isinstance(model_cfg, dict):
             mp = str(model_cfg.get("provider") or "").strip().lower()
-            if mp in {pid, canonical_slug, "custom"}:
+            # Canonicalize model.provider through the shared slug path so
+            # that custom:foo:bar matches custom:foo-bar (#6516 round-4).
+            mp_canonical = _canonicalize_custom_provider_id(mp)
+            if mp_canonical and mp_canonical in {pid, canonical_slug, "custom"}:
                 expected_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
 
     if expected_url and expected_url in match_base_urls:
@@ -3214,6 +3247,31 @@ def resolve_custom_provider_connection(
 
     cfg_data = config_data if isinstance(config_data, dict) else get_config()
 
+    # When config_data is provided (target-profile scope), block the
+    # process-env fallback for ${ENV} / key_env lookups so that a
+    # target-owned ${ENV} or key_env cannot be satisfied by an ambient
+    # process-env variable from a different profile (#6516 round-4).
+    _prev_block = getattr(_thread_ctx, "block_process_env_fallback", False)
+    if isinstance(config_data, dict):
+        _thread_ctx.block_process_env_fallback = True
+
+    try:
+        return _resolve_custom_provider_connection_inner(
+            pid, suffix, canonical_slug, cfg_data, _resolve_key,
+        )
+    finally:
+        if isinstance(config_data, dict):
+            _thread_ctx.block_process_env_fallback = _prev_block
+
+
+def _resolve_custom_provider_connection_inner(
+    pid: str,
+    suffix: str,
+    canonical_slug: str,
+    cfg_data: dict,
+    resolve_key,
+) -> tuple[str | None, str | None]:
+    """Inner worker for resolve_custom_provider_connection after env-guard setup."""
     custom_providers = cfg_data.get("custom_providers", [])
     if not isinstance(custom_providers, list):
         custom_providers = []
@@ -3241,20 +3299,20 @@ def resolve_custom_provider_connection(
         if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
             entry = custom_providers[0]
             return (
-                _resolve_key(entry.get("api_key"), entry.get("key_env"), pid),
+                resolve_key(entry.get("api_key"), entry.get("key_env"), pid),
                 str(entry.get("base_url") or "").strip() or None,
             )
         # Phase 2: no slug match — try fallback paths for setups that
         # don't use custom_providers names directly.
         return _resolve_custom_provider_fallback(
-            pid, suffix, canonical_slug, cfg_data, _resolve_key,
+            pid, suffix, canonical_slug, cfg_data, resolve_key,
         )
 
     # Phase 2: count candidates.  Single match => authoritative.
     if len(slug_matches) == 1:
         entry = slug_matches[0]
         base_url = str(entry.get("base_url") or "").strip() or None
-        api_key = _resolve_key(entry.get("api_key"), entry.get("key_env"), pid)
+        api_key = resolve_key(entry.get("api_key"), entry.get("key_env"), pid)
         return api_key, base_url
 
     # Phase 2: multiple slug-equivalent entries (lossy-slug collision).
@@ -3262,7 +3320,7 @@ def resolve_custom_provider_connection(
     # Otherwise fail closed: return None, None so the caller can decide.
     return (
         _resolve_custom_provider_ambiguous(
-            slug_matches, canonical_slug, _resolve_key, pid, cfg_data,
+            slug_matches, canonical_slug, resolve_key, pid, cfg_data,
         )
     )
 

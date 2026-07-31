@@ -419,3 +419,221 @@ def test_resolve_custom_provider_runtime_overrides_preserves_identity():
     assert key == "profile-a-key", (
         f"Retry: expected profile-a key, got {key!r}"
     )
+
+
+# ── Issue 8: target-profile authority over truthy ambient runtime values ──────
+
+
+def test_runtime_overrides_target_profile_overrides_truthy_ambient():
+    """When config_data is provided, the target profile's URL/key must
+    override conflicting truthy runtime values that may have been resolved
+    from the ambient process-global config.
+
+    Before the fix, _resolve_custom_provider_runtime_overrides only replaced
+    URL/key when incoming runtime values were falsey, so a truthy ambient
+    URL/key survived over the explicit target-profile row.
+    """
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    target_cfg = {
+        "model": {"default": "model-a", "provider": "custom:worker",
+                  "base_url": "http://target-profile:9000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://target-profile:9000/v1",
+             "api_key": "target-profile-key"},
+        ],
+    }
+
+    # Ambient runtime values are truthy — they must be overridden by the
+    # target profile's URL/key.
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", "ambient-key", "http://ambient:8000/v1",
+        config_data=target_cfg,
+    )
+    assert provider == "custom", (
+        f"Expected collapsed 'custom', got {provider!r}"
+    )
+    assert url == "http://target-profile:9000/v1", (
+        f"Target profile URL must override truthy ambient URL, got {url!r}"
+    )
+    assert key == "target-profile-key", (
+        f"Target profile key must override truthy ambient key, got {key!r}"
+    )
+
+
+def test_runtime_overrides_no_config_data_falls_back_to_ambient():
+    """When config_data is None, the old behavior is preserved: only
+    override URL/key when incoming runtime values are falsey.
+    """
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    # Without config_data, truthy ambient values survive.
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", "ambient-key", "http://ambient:8000/v1",
+        config_data=None,
+    )
+    assert provider == "custom", (
+        f"Expected collapsed 'custom', got {provider!r}"
+    )
+    assert url == "http://ambient:8000/v1", (
+        f"Without config_data, ambient URL must survive, got {url!r}"
+    )
+    assert key == "ambient-key", (
+        f"Without config_data, ambient key must survive, got {key!r}"
+    )
+
+
+# ── Issue 9: env-guard blocks process-env fallback for target-owned ${ENV} ─────
+
+
+def test_resolve_custom_provider_connection_blocks_process_env_for_target(monkeypatch):
+    """When config_data is provided, ${ENV} and key_env lookups must NOT
+    fall back to process-env variables from a different profile.
+
+    The target profile's custom_providers entry has api_key='${TARGET_ENV}'
+    and key_env='TARGET_KEY_ENV'. We set both a process-env variable and a
+    thread-local env variable. The target-owned ${ENV} should resolve from
+    the thread-local env, and the process-env variable must be ignored.
+    """
+    import api.config as config
+
+    # Set a process-env variable that should NOT be used.
+    monkeypatch.setenv("TARGET_ENV", "process-env-value")
+    monkeypatch.setenv("TARGET_KEY_ENV", "process-env-key-env-value")
+
+    target_cfg = {
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://target:9000/v1",
+             "api_key": "${TARGET_ENV}"},
+        ],
+    }
+
+    # Without thread-local env, ${ENV} should resolve to empty (process-env
+    # blocked) — the key is not found.
+    api_key, base_url = config.resolve_custom_provider_connection(
+        "custom:worker", config_data=target_cfg,
+    )
+    assert api_key is None or api_key == "", (
+        f"Process-env must be blocked for target-owned ${ENV}, got {api_key!r}"
+    )
+    assert base_url == "http://target:9000/v1"
+
+    # Now set the thread-local env — ${ENV} should resolve from it.
+    config._thread_ctx.env = {"TARGET_ENV": "thread-local-value"}
+    try:
+        api_key, base_url = config.resolve_custom_provider_connection(
+            "custom:worker", config_data=target_cfg,
+        )
+        assert api_key == "thread-local-value", (
+            f"Thread-local env must be used for ${ENV}, got {api_key!r}"
+        )
+    finally:
+        del config._thread_ctx.env
+
+
+def test_resolve_custom_provider_connection_key_env_blocks_process_env(monkeypatch):
+    """key_env must also be blocked from process-env fallback when
+    config_data is provided.
+    """
+    import api.config as config
+
+    monkeypatch.setenv("TARGET_KEY_ENV", "process-env-key-env-value")
+
+    target_cfg = {
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://target:9000/v1",
+             "key_env": "TARGET_KEY_ENV"},
+        ],
+    }
+
+    # Without thread-local env, key_env should resolve to empty (process-env
+    # blocked).
+    api_key, base_url = config.resolve_custom_provider_connection(
+        "custom:worker", config_data=target_cfg,
+    )
+    assert api_key is None or api_key == "", (
+        f"Process-env must be blocked for target-owned key_env, got {api_key!r}"
+    )
+    assert base_url == "http://target:9000/v1"
+
+    # With thread-local env, key_env should resolve from it.
+    config._thread_ctx.env = {"TARGET_KEY_ENV": "thread-local-key-env-value"}
+    try:
+        api_key, base_url = config.resolve_custom_provider_connection(
+            "custom:worker", config_data=target_cfg,
+        )
+        assert api_key == "thread-local-key-env-value", (
+            f"Thread-local env must be used for key_env, got {api_key!r}"
+        )
+    finally:
+        del config._thread_ctx.env
+
+
+# ── Issue 10: colon/hyphen active-model authority ─────────────────────────────
+
+
+def test_get_provider_base_url_colon_hyphen_active_model_authority():
+    """When the active model.provider is custom:foo:bar and the requested
+    provider_id is custom:foo-bar (or vice versa), the model section's URL
+    must be used as the trusted authority — they canonicalize to the same
+    slug.
+
+    Before the fix, _get_provider_base_url compared raw lowercase strings,
+    so custom:foo:bar did not match custom:foo-bar and the trusted active-model
+    URL was ignored.
+    """
+    import api.config as config
+    import json
+
+    cfg = {
+        "model": {"default": "test-model", "provider": "custom:foo:bar",
+                  "base_url": "http://active-model:8000/v1"},
+        "custom_providers": [
+            {"name": "foo-bar", "base_url": "http://colliding:9000/v1"},
+            {"name": "foo:bar", "base_url": "http://colliding:9000/v1"},
+        ],
+    }
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update(json.loads(json.dumps(cfg)))
+    try:
+        # Requested as custom:foo-bar — should match active custom:foo:bar
+        # via canonicalization and return the active-model URL.
+        url = config._get_provider_base_url("custom:foo-bar")
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+    assert url == "http://active-model:8000/v1", (
+        f"Canonicalized active-model authority must win, got {url!r}"
+    )
+
+
+def test_resolve_custom_provider_connection_colon_hyphen_authority():
+    """resolve_custom_provider_connection must use the canonicalized
+    model.provider to discriminate collisions.
+
+    When model.provider is custom:foo:bar and the requested provider is
+    custom:foo-bar, the expected URL from the model section must be used
+    to select the unique colliding entry.
+    """
+    import api.config as config
+
+    cfg = {
+        "model": {"default": "test-model", "provider": "custom:foo:bar",
+                  "base_url": "http://active-model:8000/v1"},
+        "custom_providers": [
+            {"name": "foo-bar", "base_url": "http://colliding:9000/v1",
+             "api_key": "colliding-key"},
+            {"name": "foo:bar", "base_url": "http://active-model:8000/v1",
+             "api_key": "active-model-key"},
+        ],
+    }
+    api_key, base_url = config.resolve_custom_provider_connection(
+        "custom:foo-bar", config_data=cfg,
+    )
+    assert base_url == "http://active-model:8000/v1", (
+        f"Canonicalized authority must select the right entry, got {base_url!r}"
+    )
+    assert api_key == "active-model-key", (
+        f"Canonicalized authority must select the right key, got {api_key!r}"
+    )
