@@ -27,6 +27,7 @@ import tempfile
 import pytest
 
 import api.config as config
+import api.profiles as profiles
 from api.providers import get_providers
 
 
@@ -514,7 +515,7 @@ def test_resolve_custom_provider_connection_blocks_process_env_for_target(monkey
         "custom:worker", config_data=target_cfg,
     )
     assert api_key is None or api_key == "", (
-        f"Process-env must be blocked for target-owned ${ENV}, got {api_key!r}"
+        f"Process-env must be blocked for target-owned ${{ENV}}, got {api_key!r}"
     )
     assert base_url == "http://target:9000/v1"
 
@@ -525,7 +526,7 @@ def test_resolve_custom_provider_connection_blocks_process_env_for_target(monkey
             "custom:worker", config_data=target_cfg,
         )
         assert api_key == "thread-local-value", (
-            f"Thread-local env must be used for ${ENV}, got {api_key!r}"
+            f"Thread-local env must be used for ${{ENV}}, got {api_key!r}"
         )
     finally:
         del config._thread_ctx.env
@@ -637,3 +638,184 @@ def test_resolve_custom_provider_connection_colon_hyphen_authority():
     assert api_key == "active-model-key", (
         f"Canonicalized authority must select the right key, got {api_key!r}"
     )
+
+
+# ── Issue 11: detached-worker 401 self-heal stays scoped to owning profile ────
+
+
+def test_self_heal_reads_owning_profile_auth_json(monkeypatch, tmp_path):
+    """A 401 self-heal initiated from a profile-A ambient context must read
+    profile-B's auth.json, not profile A's.
+
+    This is the detached-worker retry test: the streaming worker thread is
+    a detached thread that does NOT inherit the per-request profile TLS.
+    The self-heal must explicitly scope to the owning profile so the cache
+    owner stays profile B.
+    """
+    import threading
+    import contextlib
+
+    # Set up two profile homes with distinct auth.json files.
+    profile_a_home = tmp_path / "profile_a"
+    profile_b_home = tmp_path / "profile_b"
+    profile_a_home.mkdir()
+    profile_b_home.mkdir()
+
+    # Profile A's auth.json has a stale key.
+    (profile_a_home / "auth.json").write_text(
+        '{"stale": true}', encoding="utf-8"
+    )
+    # Profile B's auth.json has the fresh key.
+    (profile_b_home / "auth.json").write_text(
+        '{"provider_credentials": {"custom:test": {"api_key": "fresh-b-key"}}}',
+        encoding="utf-8",
+    )
+
+    # Track which auth.json was read.
+    read_auth_paths = []
+
+    # Patch read_auth_json at its source module (api.oauth) since
+    # _attempt_credential_self_heal does a local import from api.oauth.
+    import api.oauth as oauth_mod
+    original_read_auth = oauth_mod.read_auth_json
+
+    def _recording_read_auth(auth_path=None):
+        read_auth_paths.append(str(auth_path) if auth_path else "DEFAULT_AUTH_JSON_PATH")
+        return original_read_auth(auth_path)
+
+    monkeypatch.setattr(oauth_mod, "read_auth_json", _recording_read_auth)
+
+    # Patch resolve_runtime_provider_with_anthropic_env_lock at api.oauth.
+    monkeypatch.setattr(
+        oauth_mod,
+        "resolve_runtime_provider_with_anthropic_env_lock",
+        lambda resolver, *args, **kwargs: {
+            "provider": "custom",
+            "api_key": "fresh-b-key",
+            "base_url": "http://gpu.local:8000/v1",
+        },
+    )
+
+    # Patch resolve_runtime_provider at hermes_cli.runtime_provider.
+    import hermes_cli.runtime_provider as rtp_mod
+    monkeypatch.setattr(
+        rtp_mod,
+        "resolve_runtime_provider",
+        lambda requested=None, target_model=None: {
+            "provider": "custom",
+            "api_key": "fresh-b-key",
+            "base_url": "http://gpu.local:8000/v1",
+        },
+    )
+
+    # Patch invalidate_credential_pool_cache at api.config.
+    monkeypatch.setattr(
+        config,
+        "invalidate_credential_pool_cache",
+        lambda provider_id: None,
+    )
+
+    # Patch SESSION_AGENT_CACHE and its lock at api.config.
+    monkeypatch.setattr(config, "SESSION_AGENT_CACHE", {})
+    monkeypatch.setattr(config, "SESSION_AGENT_CACHE_LOCK", threading.Lock())
+
+    # Patch _close_cached_agent_entry_at_session_boundary at api.streaming.
+    import api.streaming as streaming_mod
+    monkeypatch.setattr(
+        streaming_mod,
+        "_close_cached_agent_entry_at_session_boundary",
+        lambda session_id, entry: None,
+    )
+
+    # Patch profile_scope_for_detached_worker at api.profiles to be a no-op
+    # context manager so the test doesn't depend on the filesystem profile
+    # layout. The self-heal's _do_self_heal closure already uses _auth_path
+    # (derived from profile_home) to read the correct auth.json.
+    @contextlib.contextmanager
+    def _noop_profile_scope(profile_name, purpose="test", logger_override=None):
+        yield
+
+    monkeypatch.setattr(
+        profiles,
+        "profile_scope_for_detached_worker",
+        _noop_profile_scope,
+    )
+
+    # Call self-heal with profile B's context.
+    result = streaming_mod._attempt_credential_self_heal(
+        "custom:test",
+        "test-session-id",
+        _agent_lock_ref=None,
+        target_model="test-model",
+        profile_name="work",
+        profile_home=str(profile_b_home),
+        original_custom_provider="custom:test",
+    )
+
+    # The self-heal must have read profile B's auth.json, not profile A's.
+    assert len(read_auth_paths) == 1
+    assert str(profile_b_home / "auth.json") in read_auth_paths[0]
+    assert str(profile_a_home / "auth.json") not in read_auth_paths[0]
+
+    # The result should contain the fresh key from profile B.
+    assert result is not None
+    assert result.get("api_key") == "fresh-b-key"
+
+
+def test_self_heal_without_profile_falls_back_to_default(monkeypatch):
+    """When no profile_name is provided, self-heal uses the default auth.json path."""
+    import threading
+
+    import api.oauth as oauth_mod
+    read_auth_paths = []
+    original_read_auth = oauth_mod.read_auth_json
+
+    def _recording_read_auth(auth_path=None):
+        read_auth_paths.append(str(auth_path) if auth_path else "DEFAULT_AUTH_JSON_PATH")
+        return original_read_auth(auth_path)
+
+    monkeypatch.setattr(oauth_mod, "read_auth_json", _recording_read_auth)
+    monkeypatch.setattr(
+        oauth_mod,
+        "resolve_runtime_provider_with_anthropic_env_lock",
+        lambda resolver, *args, **kwargs: {
+            "provider": "openai",
+            "api_key": "fresh-key",
+            "base_url": "https://api.openai.com/v1",
+        },
+    )
+
+    import hermes_cli.runtime_provider as rtp_mod
+    monkeypatch.setattr(
+        rtp_mod,
+        "resolve_runtime_provider",
+        lambda requested=None, target_model=None: {
+            "provider": "openai",
+            "api_key": "fresh-key",
+            "base_url": "https://api.openai.com/v1",
+        },
+    )
+
+    import api.streaming as streaming_mod
+    monkeypatch.setattr(config, "invalidate_credential_pool_cache", lambda provider_id: None)
+    monkeypatch.setattr(config, "SESSION_AGENT_CACHE", {})
+    monkeypatch.setattr(config, "SESSION_AGENT_CACHE_LOCK", threading.Lock())
+    monkeypatch.setattr(
+        streaming_mod,
+        "_close_cached_agent_entry_at_session_boundary",
+        lambda session_id, entry: None,
+    )
+
+    result = streaming_mod._attempt_credential_self_heal(
+        "openai",
+        "test-session-id",
+        _agent_lock_ref=None,
+        target_model="test-model",
+        profile_name=None,
+        profile_home=None,
+        original_custom_provider=None,
+    )
+
+    # Must have used the default auth.json path (no profile_home).
+    assert len(read_auth_paths) == 1
+    assert read_auth_paths[0] == "DEFAULT_AUTH_JSON_PATH"

@@ -6838,7 +6838,10 @@ def _replace_session_db_in_kwargs(agent_kwargs, state_db_path):
 
 
 def _attempt_credential_self_heal(
-    provider_id, session_id, _agent_lock_ref, *, target_model=None,
+    provider_id, session_id, _agent_lock_ref, *,
+    target_model=None,
+    profile_name=None, profile_home=None,
+    original_custom_provider=None,
 ):
     """Try to silently refresh credentials after a 401/auth error (#1401).
 
@@ -6847,13 +6850,24 @@ def _attempt_credential_self_heal(
     applicable (e.g. auth.json unchanged, provider unresolvable).
 
     Steps:
-    1. Re-read ``~/.hermes/auth.json`` to pick up fresh credentials that
-       may have been written by a concurrent ``hermes model`` CLI invocation.
+    1. Re-read the owning profile's ``auth.json`` to pick up fresh credentials
+       that may have been written by a concurrent ``hermes model`` CLI
+       invocation.  Reads the target profile's auth.json (not the fixed-root
+       AUTH_JSON_PATH) so credentials are scoped to the profile that owns
+       this session.
     2. Evict the session's cached agent so it is rebuilt with fresh keys.
     3. Evict the provider's credential-pool cache entry.
     4. Re-resolve the runtime provider.
     5. Return a new agent + resolved-provider dict (the caller must
        re-invoke ``run_conversation`` with these).
+
+    When ``profile_name`` / ``profile_home`` are provided, the entire self-heal
+    (auth.json read, cache invalidation, runtime resolution) runs inside
+    ``profile_scope_for_detached_worker`` so the detached streaming worker
+    thread resolves the owning profile's credentials rather than the ambient
+    (process-global) profile.  ``original_custom_provider`` preserves the
+    original ``custom:<slug>`` identity across the collapse so the retry site
+    can re-apply custom-provider overrides correctly.
     """
     try:
         from api.oauth import (
@@ -6866,34 +6880,58 @@ def _attempt_credential_self_heal(
         )
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        # 1. Re-read auth.json (triggers a fresh credential scan)
-        _fresh_auth = read_auth_json()
-        if not _fresh_auth:
-            logger.debug('[webui] self-heal: auth.json empty or missing, skipping')
-            return None
+        # Resolve the auth.json path for the owning profile.
+        # When profile_home is provided, use it directly; otherwise fall back
+        # to the active profile's auth store path.
+        _auth_path = None
+        if profile_home:
+            from pathlib import Path
+            _auth_path = Path(profile_home) / "auth.json"
 
-        # 2. Evict the cached agent for this session
-        _evicted_entry = None
-        with SESSION_AGENT_CACHE_LOCK:
-            _evicted_entry = SESSION_AGENT_CACHE.pop(session_id, None)
-        if _evicted_entry is not None:
-            _close_cached_agent_entry_at_session_boundary(session_id, _evicted_entry)
+        def _do_self_heal():
+            # 1. Re-read auth.json (triggers a fresh credential scan)
+            #    Use the profile-scoped auth.json path when available.
+            _fresh_auth = read_auth_json(auth_path=_auth_path) if _auth_path else read_auth_json()
+            if not _fresh_auth:
+                logger.debug('[webui] self-heal: auth.json empty or missing, skipping')
+                return None
 
-        # 3. Invalidate the credential pool for this provider
-        invalidate_credential_pool_cache(provider_id)
+            # 2. Evict the cached agent for this session
+            _evicted_entry = None
+            with SESSION_AGENT_CACHE_LOCK:
+                _evicted_entry = SESSION_AGENT_CACHE.pop(session_id, None)
+            if _evicted_entry is not None:
+                _close_cached_agent_entry_at_session_boundary(session_id, _evicted_entry)
 
-        # 4. Re-resolve runtime provider with fresh credentials
-        _new_rt = resolve_runtime_provider_with_anthropic_env_lock(
-            resolve_runtime_provider,
-            requested=provider_id,
-            target_model=target_model,
-        )
+            # 3. Invalidate the credential pool for this provider
+            invalidate_credential_pool_cache(provider_id)
 
-        logger.info(
-            '[webui] self-heal: credential refresh succeeded for provider=%s session=%s',
-            provider_id, session_id,
-        )
-        return _new_rt
+            # 4. Re-resolve runtime provider with fresh credentials
+            _new_rt = resolve_runtime_provider_with_anthropic_env_lock(
+                resolve_runtime_provider,
+                requested=provider_id,
+                target_model=target_model,
+            )
+
+            logger.info(
+                '[webui] self-heal: credential refresh succeeded for provider=%s session=%s',
+                provider_id, session_id,
+            )
+            return _new_rt
+
+        # Run the self-heal inside the owning profile's scope so the detached
+        # streaming worker thread resolves the correct profile's credentials.
+        if profile_name:
+            from api.profiles import profile_scope_for_detached_worker
+            with profile_scope_for_detached_worker(
+                profile_name,
+                purpose="credential-self-heal",
+            ):
+                _result = _do_self_heal()
+        else:
+            _result = _do_self_heal()
+
+        return _result
     except Exception as _heal_err:
         logger.warning(
             '[webui] self-heal: failed for provider=%s session=%s: %s',
@@ -9560,6 +9598,9 @@ def _run_agent_streaming(
                         _heal_rt = _attempt_credential_self_heal(
                             resolved_provider or '', session_id, _agent_lock,
                             target_model=resolved_model,
+                            profile_name=_resolved_profile_name,
+                            profile_home=_profile_home,
+                            original_custom_provider=_custom_provider_identity,
                         )
                         if _heal_rt is not None:
                             logger.info('[webui] self-heal: retrying stream after credential refresh')
@@ -10792,6 +10833,9 @@ def _run_agent_streaming(
                 _heal_rt = _attempt_credential_self_heal(
                     resolved_provider or '', session_id, _agent_lock,
                     target_model=resolved_model,
+                    profile_name=_resolved_profile_name,
+                    profile_home=_profile_home,
+                    original_custom_provider=_custom_provider_identity,
                 )
                 if _heal_rt is not None:
                     logger.info('[webui] self-heal (except path): retrying stream after credential refresh')
