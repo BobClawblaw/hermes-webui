@@ -274,3 +274,100 @@ def test_load_settings_default_model_provider_normalised(monkeypatch):
         f"Expected normalised default_model_provider "
         f"'custom:192.168.5.242-8000', got {dmp!r}"
     )
+
+
+# ── Bug 4: resolve_custom_provider_connection slug collision and config snapshot ──
+
+
+def _config_dict(**overrides) -> dict:
+    """Build a minimal config dict with an optional ``custom_providers`` list."""
+    base = {
+        "model": {
+            "default": "test-model",
+            "provider": "custom:test-provider",
+            "base_url": "http://default.test/v1",
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def test_resolve_custom_provider_connection_one_blank_one_populated():
+    """A lossy-slug collision with one blank entry and one populated entry
+    must resolve to the populated entry's URL and key."""
+    cfg = _config_dict(
+        custom_providers=[
+            {"name": "my-endpoint!", "base_url": "http://valid.test/v1", "api_key": "real-key"},
+            {"name": "my_endpoint!", "base_url": "", "api_key": ""},
+        ],
+    )
+    key, url = config.resolve_custom_provider_connection(
+        "custom:my-endpoint", config_data=cfg,
+    )
+    assert url == "http://valid.test/v1", (
+        f"Expected URL from populated entry, got {url!r}"
+    )
+    assert key == "real-key", (
+        f"Expected key from populated entry, got {key!r}"
+    )
+
+
+def test_resolve_custom_provider_connection_lossy_slug_collision_no_dummy_key():
+    """Two lossy-slug-sibling entries with distinct URLs must fail closed
+    (return None, None) rather than emitting a dummy key or picking the
+    first entry."""
+    cfg = _config_dict(
+        custom_providers=[
+            {"name": "endpoint-a!", "base_url": "http://a.test/v1", "api_key": "key-a"},
+            {"name": "endpoint-a?", "base_url": "http://b.test/v1", "api_key": "key-b"},
+        ],
+    )
+    key, url = config.resolve_custom_provider_connection(
+        "custom:endpoint-a", config_data=cfg,
+    )
+    assert key is None, f"Expected None for ambiguous collision, got key={key!r}"
+    assert url is None, f"Expected None for ambiguous collision, got url={url!r}"
+
+
+def test_resolve_custom_provider_connection_expected_url_discriminates():
+    """When slug-sibling entries collide and the model section provides a
+    ``base_url`` matching exactly one sibling, that sibling wins."""
+    cfg = _config_dict(
+        custom_providers=[
+            {"name": "sib-a", "base_url": "http://first.test/v1", "api_key": "key-a"},
+            {"name": "sib-a", "base_url": "http://second.test/v1", "api_key": "key-b"},
+        ],
+        model={
+            "default": "test-model",
+            "provider": "custom:sib-a",
+            "base_url": "http://second.test/v1",
+        },
+    )
+    key, url = config.resolve_custom_provider_connection(
+        "custom:sib-a", config_data=cfg,
+    )
+    assert url == "http://second.test/v1", (
+        f"Expected discriminated URL, got {url!r}"
+    )
+    assert key == "key-b", (
+        f"Expected discriminated key, got {key!r}"
+    )
+
+
+def test_resolve_custom_provider_connection_accepts_config_data():
+    """``resolve_custom_provider_connection`` must accept an explicit
+    ``config_data`` dict instead of reading ambient ``get_config()``."""
+    cfg = _config_dict(
+        custom_providers=[
+            {"name": "worker", "base_url": "http://worker.test/v1", "api_key": "worker-key"},
+        ],
+    )
+    key, url = config.resolve_custom_provider_connection(
+        "custom:worker", config_data=cfg,
+    )
+    assert url == "http://worker.test/v1", (
+        f"Expected worker URL from config_data, got {url!r}"
+    )
+    assert key == "worker-key", (
+        f"Expected worker key from config_data, got {key!r}"
+    )
