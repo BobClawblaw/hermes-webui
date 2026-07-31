@@ -8520,6 +8520,7 @@ def _run_agent_streaming(
             # so that the target profile's custom_providers[] entries are consulted
             # instead of the ambient process-global config (#6516 gate finding).
             from api.config import get_config_for_profile_home as _get_config_for_home
+            _custom_provider_identity = None
             try:
                 _cfg = _get_config_for_home(_profile_home)
             except Exception:
@@ -8531,6 +8532,17 @@ def _run_agent_streaming(
             # custom_providers[] so WebUI can pass explicit creds/base_url.
             # Pass the target profile's _cfg so the correct profile's URL/key
             # is used rather than the ambient process-global config.
+            # Preserve the original custom:slug identity for retry paths.
+            # _resolve_custom_provider_runtime_overrides collapses custom:slug
+            # to plain "custom" after resolving the endpoint, but the 401-retry
+            # paths must re-resolve from the owning profile's config — passing
+            # the already-collapsed "custom" back would skip the custom: guard
+            # and never consult config_data (#6516 re-gate).
+            _custom_provider_identity = (
+                resolved_provider
+                if isinstance(resolved_provider, str) and resolved_provider.startswith("custom:")
+                else None
+            )
             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
                 resolved_provider, resolved_api_key, resolved_base_url,
                 config_data=_cfg,
@@ -9535,7 +9547,7 @@ def _run_agent_streaming(
                                 _heal_rt, resolved_provider, configured_base_url
                             )
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                                resolved_provider, resolved_api_key, resolved_base_url,
+                                _custom_provider_identity or resolved_provider, resolved_api_key, resolved_base_url,
                                 config_data=_cfg,
                             )
                             # Rebuild agent kwargs and create a fresh agent
@@ -10768,7 +10780,7 @@ def _run_agent_streaming(
                         _heal_rt, resolved_provider, configured_base_url
                     )
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                        resolved_provider, resolved_api_key, resolved_base_url,
+                        _custom_provider_identity or resolved_provider, resolved_api_key, resolved_base_url,
                         config_data=_cfg,
                     )
                     # Build a fresh agent with the new credentials

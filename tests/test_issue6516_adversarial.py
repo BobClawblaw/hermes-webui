@@ -287,3 +287,135 @@ def test_resolve_custom_provider_runtime_overrides_uses_config_data():
     assert key == "profile-b-key", (
         f"Retry 2: expected profile-b key, got {key!r}"
     )
+
+
+# ── Issue 6: URL-less collision fail-closed ───────────────────────────────────
+
+
+def test_get_provider_base_url_url_less_collision_fails_closed():
+    """When two custom_providers entries slugify to the same slug but one has
+    a blank base_url, _get_provider_base_url must return None — NOT the
+    sibling's URL.
+
+    Before the fix, slug_matches only appended URL-bearing entries, so the
+    URL-less colliding entry was invisible to the len > 1 check and the
+    sibling's URL was returned.  After the fix, ALL slug-matching entries
+    are counted, so the collision is detected and None is returned.
+    """
+    import api.config as config
+    import json
+
+    cfg = {
+        "model": {"default": "test-model", "provider": "openai"},
+        "custom_providers": [
+            {"name": "foo:bar", "base_url": "http://sibling.example/v1",
+             "api_key": "sibling-key"},
+            {"name": "foo-bar", "base_url": "", "api_key": ""},
+        ],
+    }
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update(json.loads(json.dumps(cfg)))
+    try:
+        url = config._get_provider_base_url("custom:foo-bar")
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+    assert url is None, (
+        f"URL-less collision must fail closed (return None), got {url!r}"
+    )
+
+
+def test_get_provider_base_url_single_match_with_url_returns_url():
+    """When exactly one entry matches (even if a sibling with a blank URL
+    exists but doesn't slug-match), the URL is returned.
+    """
+    import api.config as config
+    import json
+
+    cfg = {
+        "model": {"default": "test-model", "provider": "openai"},
+        "custom_providers": [
+            {"name": "foo:bar", "base_url": "http://valid.example/v1",
+             "api_key": "valid-key"},
+            {"name": "other:provider", "base_url": "", "api_key": ""},
+        ],
+    }
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update(json.loads(json.dumps(cfg)))
+    try:
+        url = config._get_provider_base_url("custom:foo-bar")
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+    assert url == "http://valid.example/v1", (
+        f"Single match should return URL, got {url!r}"
+    )
+
+
+# ── Issue 7: custom:slug identity preserved through retry ─────────────────────
+
+
+def test_resolve_custom_provider_runtime_overrides_preserves_identity():
+    """_resolve_custom_provider_runtime_overrides must collapse custom:slug
+    to plain 'custom' on the initial resolution, but the caller (streaming
+    worker) must retain the original custom:slug for retry paths.
+
+    This test verifies that calling _resolve_custom_provider_runtime_overrides
+    with a custom:slug provider returns 'custom' as the provider (collapsed),
+    and that a second call with the collapsed 'custom' value does NOT re-enter
+    the custom: resolution path (returns 'custom' unchanged).
+    """
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    profile_cfg = {
+        "model": {"default": "model-a", "provider": "custom:worker",
+                  "base_url": "http://profile-a:8000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://profile-a:8000/v1",
+             "api_key": "profile-a-key"},
+        ],
+    }
+
+    # Initial resolution: custom:worker → custom (collapsed)
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", None, None,
+        config_data=profile_cfg,
+    )
+    assert provider == "custom", (
+        f"Initial: expected collapsed 'custom', got {provider!r}"
+    )
+    assert url == "http://profile-a:8000/v1", (
+        f"Initial: expected profile-a URL, got {url!r}"
+    )
+    assert key == "profile-a-key", (
+        f"Initial: expected profile-a key, got {key!r}"
+    )
+
+    # Retry with collapsed 'custom': must NOT re-enter custom: path
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom", None, None,
+        config_data=profile_cfg,
+    )
+    assert provider == "custom", (
+        f"Retry: collapsed 'custom' must pass through, got {provider!r}"
+    )
+    assert url is None, (
+        f"Retry: collapsed 'custom' must not resolve URL, got {url!r}"
+    )
+
+    # Retry with original custom:worker: must re-resolve from config_data
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", None, None,
+        config_data=profile_cfg,
+    )
+    assert provider == "custom", (
+        f"Retry: expected collapsed 'custom', got {provider!r}"
+    )
+    assert url == "http://profile-a:8000/v1", (
+        f"Retry: expected profile-a URL, got {url!r}"
+    )
+    assert key == "profile-a-key", (
+        f"Retry: expected profile-a key, got {key!r}"
+    )

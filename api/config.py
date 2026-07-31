@@ -2633,23 +2633,25 @@ def _get_provider_base_url(provider_id):
             model_base = (model_cfg.get("base_url") or "").strip().rstrip("/")
             if model_base:
                 return model_base
-    # Check custom_providers list for a matching entry.  Collect ALL matches
-    # and fail closed (return None) when more than one entry slugifies to the
-    # same slug — a lossy collision means we cannot trust which endpoint the
-    # user intended (#6516 gate finding).
-    slug_matches: list[str] = []
+    # Check custom_providers list for a matching entry.  Count ALL
+    # slug-equivalent entries (not just those with a non-empty base_url)
+    # and fail closed when more than one entry slugifies to the same slug.
+    # A URL-less colliding entry must NOT be invisible to the fail-closed
+    # check — counting only URL-bearing matches would let a crafted sibling
+    # silently shadow the intended endpoint (#6516 re-gate).
+    slug_match_count = 0
+    slug_match_url = None
     for entry in _custom_provider_entries():
         if not isinstance(entry, dict):
             continue
         slug = _custom_provider_slug_from_name(entry.get("name"))
         if slug and slug.lower() == pid_lower:
+            slug_match_count += 1
             cp_base = str(entry.get("base_url") or "").strip().rstrip("/")
             if cp_base:
-                slug_matches.append(cp_base)
-    if len(slug_matches) == 1:
-        return slug_matches[0]
-    if len(slug_matches) > 1:
-        return None
+                slug_match_url = cp_base
+    if slug_match_count == 1:
+        return slug_match_url
     return None
 
 
@@ -3147,8 +3149,12 @@ def _resolve_custom_provider_ambiguous(
         candidates = match_base_urls[expected_url]
         if len(candidates) == 1:
             entry = candidates[0]
+            # Prohibit the shared slug-derived env-key fallback after
+            # collision disambiguation — a crafted colliding entry must
+            # not be able to steer credential lookup to an unrelated
+            # env var.  Only use the entry's own api_key / key_env.
             return (
-                resolve_key(entry.get("api_key"), entry.get("key_env"), pid),
+                resolve_key(entry.get("api_key"), entry.get("key_env"), None),
                 str(entry.get("base_url") or "").strip() or None,
             )
 
@@ -3228,6 +3234,16 @@ def resolve_custom_provider_connection(
             slug_matches.append(entry)
 
     if not slug_matches:
+        # Sole-custom-provider fallback: if exactly one custom provider is
+        # configured and its slug didn't match, use it as a pragmatic fallback
+        # for mismatched slugs (e.g. punctuation differences).  This was
+        # present in origin/master and must be preserved (#6516 re-gate).
+        if len(custom_providers) == 1 and isinstance(custom_providers[0], dict):
+            entry = custom_providers[0]
+            return (
+                _resolve_key(entry.get("api_key"), entry.get("key_env"), pid),
+                str(entry.get("base_url") or "").strip() or None,
+            )
         # Phase 2: no slug match — try fallback paths for setups that
         # don't use custom_providers names directly.
         return _resolve_custom_provider_fallback(
