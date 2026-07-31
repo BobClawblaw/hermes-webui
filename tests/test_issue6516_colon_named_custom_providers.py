@@ -294,11 +294,23 @@ def _config_dict(**overrides) -> dict:
 
 def test_resolve_custom_provider_connection_one_blank_one_populated():
     """A lossy-slug collision with one blank entry and one populated entry
-    must resolve to the populated entry's URL and key."""
+    must resolve to the populated entry's URL and key.
+
+    Uses ``my-endpoint!`` and ``my-endpoint?`` — both slugify to
+    ``custom:my-endpoint`` (the ``!`` and ``?`` are stripped by the slugger),
+    so they are genuine slug siblings.  The populated entry (non-empty
+    base_url) wins via the discriminator in ``_resolve_custom_provider_ambiguous``
+    which uses ``model.base_url`` to pick the unique match.
+    """
     cfg = _config_dict(
+        model={
+            "default": "test-model",
+            "provider": "custom:my-endpoint",
+            "base_url": "http://valid.test/v1",
+        },
         custom_providers=[
             {"name": "my-endpoint!", "base_url": "http://valid.test/v1", "api_key": "real-key"},
-            {"name": "my_endpoint!", "base_url": "", "api_key": ""},
+            {"name": "my-endpoint?", "base_url": "", "api_key": ""},
         ],
     )
     key, url = config.resolve_custom_provider_connection(

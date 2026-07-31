@@ -441,6 +441,7 @@ def _resolve_custom_provider_runtime_overrides(
     resolved_provider: str | None,
     resolved_api_key: str | None,
     resolved_base_url: str | None,
+    config_data: dict | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Return provider/key/base_url overrides for ``custom:*`` endpoints.
 
@@ -449,11 +450,21 @@ def _resolve_custom_provider_runtime_overrides(
     without authentication, so a missing key should not fail before the first
     request; pass a harmless placeholder to the SDK and let the endpoint accept
     it or return its own auth error.
+
+    When *config_data* is given it is forwarded to
+    ``resolve_custom_provider_connection`` so the target profile's
+    ``custom_providers[]`` entries are consulted instead of the ambient
+    process-global config.  This is critical in the streaming worker, which is
+    a detached thread that does NOT inherit the per-request thread-local
+    profile context — without *config_data* the wrong profile's URL/key can
+    leak into a session running under a different profile (#6516 gate finding).
     """
     if not (isinstance(resolved_provider, str) and resolved_provider.startswith("custom:")):
         return resolved_provider, resolved_api_key, resolved_base_url
 
-    _cp_key, _cp_base = resolve_custom_provider_connection(resolved_provider)
+    _cp_key, _cp_base = resolve_custom_provider_connection(
+        resolved_provider, config_data=config_data,
+    )
     if not resolved_api_key and _cp_key:
         resolved_api_key = _cp_key
     if not resolved_base_url and _cp_base:
@@ -8496,13 +8507,6 @@ def _run_agent_streaming(
             except Exception as _e:
                 print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
-            # Named custom providers (custom:slug) may not be resolvable by
-            # hermes_cli.runtime_provider directly. Fall back to config.yaml
-            # custom_providers[] so WebUI can pass explicit creds/base_url.
-            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                resolved_provider, resolved_api_key, resolved_base_url
-            )
-
             # Read per-profile config at call time (not module-level snapshot).
             # The streaming worker is a detached thread that does NOT inherit the
             # per-request thread-local profile context, so the ambient
@@ -8511,12 +8515,26 @@ def _run_agent_streaming(
             # this run (issue #3294). Read the SESSION's own profile home
             # explicitly so toolsets and context match the profile the session
             # actually runs under.
+            #
+            # This _cfg is loaded BEFORE _resolve_custom_provider_runtime_overrides
+            # so that the target profile's custom_providers[] entries are consulted
+            # instead of the ambient process-global config (#6516 gate finding).
             from api.config import get_config_for_profile_home as _get_config_for_home
             try:
                 _cfg = _get_config_for_home(_profile_home)
             except Exception:
                 from api.config import get_config as _get_config
                 _cfg = _get_config()
+
+            # Named custom providers (custom:slug) may not be resolvable by
+            # hermes_cli.runtime_provider directly. Fall back to config.yaml
+            # custom_providers[] so WebUI can pass explicit creds/base_url.
+            # Pass the target profile's _cfg so the correct profile's URL/key
+            # is used rather than the ambient process-global config.
+            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
+                resolved_provider, resolved_api_key, resolved_base_url,
+                config_data=_cfg,
+            )
             _prefill_context = _load_webui_prefill_context(_cfg)
             _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg)
             _prefill_messages = _normalize_prefill_messages_before_user_turn(_prefill_messages)
@@ -9517,7 +9535,8 @@ def _run_agent_streaming(
                                 _heal_rt, resolved_provider, configured_base_url
                             )
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                                resolved_provider, resolved_api_key, resolved_base_url
+                                resolved_provider, resolved_api_key, resolved_base_url,
+                                config_data=_cfg,
                             )
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
@@ -10749,7 +10768,8 @@ def _run_agent_streaming(
                         _heal_rt, resolved_provider, configured_base_url
                     )
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                        resolved_provider, resolved_api_key, resolved_base_url
+                        resolved_provider, resolved_api_key, resolved_base_url,
+                        config_data=_cfg,
                     )
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}

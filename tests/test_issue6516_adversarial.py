@@ -215,3 +215,75 @@ def test_get_providers_active_provider_x_ai(tmp_path, monkeypatch):
         f"Expected active_provider 'x-ai', got {ap!r}. "
         "x-ai must not be alias-resolved to xai."
     )
+
+
+# ── Issue 4: two-profile production-composition regression ──────────────────
+
+
+def test_resolve_custom_provider_runtime_overrides_uses_config_data():
+    """``_resolve_custom_provider_runtime_overrides`` must consult the
+    ``config_data`` dict (the target profile's config) rather than the
+    ambient ``get_config()`` when resolving a named ``custom:*`` provider.
+
+    This is the production-composition regression: when the streaming worker
+    runs under profile A but a session is routed to profile B, the initial
+    send and both credential self-heal retries must pick up profile B's
+    URL/key sentinels, not profile A's.
+    """
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    profile_a_cfg = {
+        "model": {"default": "model-a", "provider": "custom:worker",
+                  "base_url": "http://profile-a:8000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://profile-a:8000/v1",
+             "api_key": "profile-a-key"},
+        ],
+    }
+    profile_b_cfg = {
+        "model": {"default": "model-b", "provider": "custom:worker",
+                  "base_url": "http://profile-b:9000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://profile-b:9000/v1",
+             "api_key": "profile-b-key"},
+        ],
+    }
+
+    # Initial send: must use profile B's config, not the ambient (A) config.
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", None, None,
+        config_data=profile_b_cfg,
+    )
+    assert url == "http://profile-b:9000/v1", (
+        f"Initial send: expected profile-b URL, got {url!r}"
+    )
+    assert key == "profile-b-key", (
+        f"Initial send: expected profile-b key, got {key!r}"
+    )
+    assert provider == "custom", (
+        f"Initial send: expected collapsed 'custom' provider, got {provider!r}"
+    )
+
+    # Retry path 1 (self-heal on 401): same config_data must still win.
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", None, None,
+        config_data=profile_b_cfg,
+    )
+    assert url == "http://profile-b:9000/v1", (
+        f"Retry 1: expected profile-b URL, got {url!r}"
+    )
+    assert key == "profile-b-key", (
+        f"Retry 1: expected profile-b key, got {key!r}"
+    )
+
+    # Retry path 2 (except-path self-heal): same config_data must still win.
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker", None, None,
+        config_data=profile_b_cfg,
+    )
+    assert url == "http://profile-b:9000/v1", (
+        f"Retry 2: expected profile-b URL, got {url!r}"
+    )
+    assert key == "profile-b-key", (
+        f"Retry 2: expected profile-b key, got {key!r}"
+    )

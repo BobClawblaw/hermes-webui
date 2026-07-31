@@ -1480,6 +1480,16 @@ def _resolve_configured_provider_id(
     if named_slug:
         return named_slug
 
+    # Preserve IDs that are already canonical in the WebUI provider tables.
+    # ``x-ai`` and ``google`` are canonical slugs in ``_PROVIDER_DISPLAY`` /
+    # ``_PROVIDER_MODELS`` but the agent alias table maps them to ``xai`` and
+    # ``gemini`` respectively.  Applying the alias would make the active-provider
+    # badge and provider card mismatch their own row (#6516 gate finding).
+    # This check mirrors the logic in ``_canonicalise_provider_id``.
+    raw = str(provider or "").strip().lower()
+    if raw in _PROVIDER_DISPLAY or raw in _PROVIDER_MODELS:
+        return raw
+
     if not resolve_alias:
         raw = str(provider or "").strip().lower()
         if base_url and raw == "custom":
@@ -2590,16 +2600,19 @@ def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
 def _get_provider_base_url(provider_id):
     """Look up the configured base_url for a provider (e.g. lmstudio).
 
-    Checks three locations, in order:
+    Checks four locations, in order:
       1. ``cfg["providers"][<provider_id>]["base_url"]`` — the explicit
          per-provider override.
-      2. ``cfg["custom_providers"][]`` entries whose slug matches
+      2. ``cfg["model"]["base_url"]`` — the model block carries both the
+         active provider AND the base URL for that provider in a single
+         record.  This runs before the custom_providers list so the active
+         provider's URL is authoritative even when a lossy-slug collision
+         exists in ``custom_providers[]`` (#6516).
+      3. ``cfg["custom_providers"][]`` entries whose slug matches
          *provider_id* — handles custom providers declared via the
          ``custom_providers`` list (e.g. ``custom:192.168.5.250-8000``).
-      3. ``cfg["model"]["base_url"]`` — falls back here when
-         ``cfg["model"]["provider"] == provider_id``. This is the historical
-         shape (the model block carries both the active provider AND the
-         base URL for that provider in a single record).
+         When more than one entry slugifies to the same slug, returns None
+         (fail closed) rather than silently picking the first match.
 
     Returns the URL stripped of trailing ``/`` if configured, otherwise None.
     """
@@ -2607,8 +2620,24 @@ def _get_provider_base_url(provider_id):
     explicit = (prov_cfg.get("base_url") or "").strip().rstrip("/")
     if explicit:
         return explicit
-    # Check custom_providers list for a matching entry
+    # Check the model section FIRST — the active provider's model block is
+    # authoritative for the default provider's base_url.  This must run before
+    # the custom_providers list scan so that a lossy-slug collision in
+    # custom_providers[] does not shadow the model section's URL for the
+    # active provider (#6516 gate finding).
     pid_lower = str(provider_id or "").strip().lower()
+    model_cfg = cfg.get("model", {}) or {}
+    if isinstance(model_cfg, dict):
+        model_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if model_provider == pid_lower:
+            model_base = (model_cfg.get("base_url") or "").strip().rstrip("/")
+            if model_base:
+                return model_base
+    # Check custom_providers list for a matching entry.  Collect ALL matches
+    # and fail closed (return None) when more than one entry slugifies to the
+    # same slug — a lossy collision means we cannot trust which endpoint the
+    # user intended (#6516 gate finding).
+    slug_matches: list[str] = []
     for entry in _custom_provider_entries():
         if not isinstance(entry, dict):
             continue
@@ -2616,14 +2645,11 @@ def _get_provider_base_url(provider_id):
         if slug and slug.lower() == pid_lower:
             cp_base = str(entry.get("base_url") or "").strip().rstrip("/")
             if cp_base:
-                return cp_base
-    model_cfg = cfg.get("model", {}) or {}
-    if isinstance(model_cfg, dict):
-        model_provider = str(model_cfg.get("provider") or "").strip().lower()
-        if model_provider == str(provider_id).strip().lower():
-            model_base = (model_cfg.get("base_url") or "").strip().rstrip("/")
-            if model_base:
-                return model_base
+                slug_matches.append(cp_base)
+    if len(slug_matches) == 1:
+        return slug_matches[0]
+    if len(slug_matches) > 1:
+        return None
     return None
 
 
