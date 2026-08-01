@@ -28,6 +28,7 @@ import pytest
 
 import api.config as config
 import api.profiles as profiles
+import api.streaming as streaming  # noqa: F401  (used by r5 composed tests)
 from api.providers import get_providers
 
 
@@ -520,6 +521,10 @@ def test_resolve_custom_provider_connection_blocks_process_env_for_target(monkey
     assert base_url == "http://target:9000/v1"
 
     # Now set the thread-local env — ${ENV} should resolve from it.
+    # Preserve any pre-existing thread-local env exactly (presence + value) so
+    # a combined test process or a prior profile scope is not erased (#6516 r5).
+    _prior_env_exists = hasattr(config._thread_ctx, "env")
+    _prior_env_value = getattr(config._thread_ctx, "env", None)
     config._thread_ctx.env = {"TARGET_ENV": "thread-local-value"}
     try:
         api_key, base_url = config.resolve_custom_provider_connection(
@@ -529,7 +534,13 @@ def test_resolve_custom_provider_connection_blocks_process_env_for_target(monkey
             f"Thread-local env must be used for ${{ENV}}, got {api_key!r}"
         )
     finally:
-        del config._thread_ctx.env
+        if _prior_env_exists:
+            config._thread_ctx.env = _prior_env_value
+        else:
+            try:
+                del config._thread_ctx.env
+            except AttributeError:
+                pass
 
 
 def test_resolve_custom_provider_connection_key_env_blocks_process_env(monkeypatch):
@@ -558,6 +569,10 @@ def test_resolve_custom_provider_connection_key_env_blocks_process_env(monkeypat
     assert base_url == "http://target:9000/v1"
 
     # With thread-local env, key_env should resolve from it.
+    # Preserve any pre-existing thread-local env exactly (presence + value) so
+    # a combined test process or a prior profile scope is not erased (#6516 r5).
+    _prior_env_exists = hasattr(config._thread_ctx, "env")
+    _prior_env_value = getattr(config._thread_ctx, "env", None)
     config._thread_ctx.env = {"TARGET_KEY_ENV": "thread-local-key-env-value"}
     try:
         api_key, base_url = config.resolve_custom_provider_connection(
@@ -567,7 +582,13 @@ def test_resolve_custom_provider_connection_key_env_blocks_process_env(monkeypat
             f"Thread-local env must be used for key_env, got {api_key!r}"
         )
     finally:
-        del config._thread_ctx.env
+        if _prior_env_exists:
+            config._thread_ctx.env = _prior_env_value
+        else:
+            try:
+                del config._thread_ctx.env
+            except AttributeError:
+                pass
 
 
 # ── Issue 10: colon/hyphen active-model authority ─────────────────────────────
@@ -819,3 +840,290 @@ def test_self_heal_without_profile_falls_back_to_default(monkeypatch):
     # Must have used the default auth.json path (no profile_home).
     assert len(read_auth_paths) == 1
     assert read_auth_paths[0] == "DEFAULT_AUTH_JSON_PATH"
+
+
+# ── Round-5: production-composed streaming 401 self-heal ownership ───────────
+# These tests drive the real _run_agent_streaming() (not helper-level) through
+# the returned-401 credential self-heal path and assert the actual AIAgent
+# constructor values on both the initial send and the retry stay on the owning
+# profile's custom:<slug> URL/key — never an ambient process-global sentinel —
+# and that the self-heal invalidates the NAMED custom:<slug> identity (#6516 r5).
+
+
+import queue
+import sys
+import types
+
+import api.models as _api_models
+from api.models import Session as _Session
+
+
+def _r5_make_session(tmp_path, session_id, model, msg):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(exist_ok=True)
+    session = _Session(
+        session_id=session_id,
+        title="r5 streaming",
+        workspace=str(tmp_path),
+        model=model,
+        messages=[],
+        context_messages=[],
+    )
+    session.pending_user_message = msg
+    session.pending_started_at = 1.0
+    session.save()
+    return session, session_dir
+
+
+def _r5_drive_streaming_401(
+    tmp_path,
+    monkeypatch,
+    *,
+    target_cfg,
+    ambient_key,
+    ambient_url,
+    mode="returned",
+):
+    """Drive the real ``_run_agent_streaming()`` through a 401 self-heal path
+    for a named custom:<slug> provider.
+
+    *mode* selects which self-heal branch ``run_conversation`` triggers:
+      - ``"returned"``: the agent returns an auth-classified error result
+        (the returned-401 self-heal path, ~line 9678).
+      - ``"raised"``:  the agent raises an auth-classified exception (the
+        except-path self-heal, ~line 10898/10969).
+
+    Returns ``(constructions, invalidated_ids)`` where *constructions* is the
+    list of AIAgent constructor-kwargs dicts (initial send and any retries) and
+    *invalidated_ids* is the list of provider ids handed to
+    ``invalidate_credential_pool_cache`` during self-heal.
+    """
+    session_id = "r5_stream_session"
+    stream_id = "r5-stream"
+    model = "worker-model"
+    msg = "hello from custom provider"
+
+    session, session_dir = _r5_make_session(tmp_path, session_id, model, msg)
+    session.active_stream_id = stream_id
+
+    constructions = []
+
+    class _RecordingAgent:
+        def __init__(self, **kwargs):
+            constructions.append(dict(kwargs))
+            self.session_id = kwargs.get("session_id")
+            self.stream_delta_callback = kwargs.get("stream_delta_callback")
+            self.context_compressor = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.reasoning_config = None
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            if mode == "raised":
+                # Raise an auth-classified exception so the except-path
+                # self-heal (raised-401) branch runs.
+                raise RuntimeError("401 AuthenticationError: invalid api key")
+            # Return an auth-classified error so the returned-401 self-heal
+            # path runs.
+            return {
+                "messages": [{"role": "assistant", "content": ""}],
+                "error": "401 AuthenticationError: invalid api key",
+                "status": "error",
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = lambda *_args, **_kwargs: object()
+
+    invalidated_ids = []
+
+    with monkeypatch.context() as m:
+        # ── Isolate streaming/models module state, restoring originals after.
+        # Using monkeypatch.setattr makes pytest restore the prior global object
+        # references, so this test never pollutes later tests in a full run
+        # (#6516 r5 test hygiene).
+        threading_module = __import__("threading")
+        m.setattr(_api_models, "SESSION_DIR", session_dir)
+        m.setattr(_api_models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+        m.setattr(streaming, "SESSION_DIR", session_dir)
+        m.setattr(_api_models, "SESSIONS", {session_id: session})
+        m.setattr(streaming, "SESSIONS", {session_id: session})
+        m.setattr(streaming, "SESSION_AGENT_LOCKS_LOCK", threading_module.Lock())
+        m.setattr(config, "SESSION_AGENT_CACHE_LOCK", threading_module.Lock())
+        m.setattr(streaming, "STREAMS", {stream_id: queue.Queue()})
+        m.setattr(streaming, "AGENT_INSTANCES", {})
+        m.setattr(streaming, "SESSION_AGENT_LOCKS", {})
+        m.setattr(streaming, "PENDING_GOAL_CONTINUATION", {})
+        m.setattr(config, "SESSION_AGENT_CACHE", __import__("collections").OrderedDict())
+        event_queue = streaming.STREAMS[stream_id]
+
+        m.setattr(streaming, "AIAgent", _RecordingAgent)
+        m.setattr(streaming, "get_session", lambda _sid: session)
+        m.setattr(
+            streaming, "resolve_model_provider",
+            lambda *a, **k: (model, "custom:worker", target_cfg.get("model", {}).get("base_url")),
+        )
+        # Runtime provider resolution — ambient sentinels that must NOT leak.
+        m.setattr(
+            "api.oauth.resolve_runtime_provider_with_anthropic_env_lock",
+            lambda resolver, *a, **k: {"provider": "custom", "api_key": ambient_key, "base_url": ambient_url},
+        )
+        m.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, target_model=None: {"provider": "custom", "api_key": ambient_key, "base_url": ambient_url},
+        )
+        # Self-heal needs a truthy auth store so the retry agent is rebuilt.
+        m.setattr(
+            "api.oauth.read_auth_json",
+            lambda auth_path=None: {"provider_credentials": {}},
+        )
+        # Target profile config (env expansion + custom_providers) at send time.
+        m.setattr("api.config.get_config_for_profile_home", lambda home: target_cfg)
+        m.setattr("api.config.get_config", lambda *a, **k: target_cfg)
+        m.setattr("api.config._resolve_cli_toolsets", lambda *a, **k: [])
+
+        def _rec_invalidate(provider_id):
+            invalidated_ids.append(provider_id)
+        m.setattr(config, "invalidate_credential_pool_cache", _rec_invalidate)
+        m.setattr(streaming, "_get_ai_agent", lambda: _RecordingAgent)
+        m.setattr(
+            streaming, "_close_cached_agent_entry_at_session_boundary",
+            lambda *a, **k: None,
+        )
+        m.setitem(sys.modules, "hermes_state", fake_hermes_state)
+
+        streaming._run_agent_streaming(
+            session_id=session_id,
+            msg_text=msg,
+            model=model,
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+        )
+
+    while not event_queue.empty():
+        event_queue.get_nowait()
+    return constructions, invalidated_ids
+
+
+def test_r5_returned_401_retry_keeps_target_url_key(monkeypatch, tmp_path):
+    """The returned-401 self-heal (a real _run_agent_streaming run) must rebuild
+    the agent with the owning profile's custom:<slug> URL/key on BOTH the initial
+    and retry AIAgent constructors — an ambient sentinel must never appear, and
+    the self-heal must invalidate the NAMED custom:<slug> identity (#6516 r5)."""
+    target_cfg = {
+        "model": {"default": "worker-model", "provider": "custom:worker",
+                  "base_url": "http://target-profile:9000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://target-profile:9000/v1",
+             "api_key": "target-profile-key"},
+        ],
+    }
+    constructions, invalidated = _r5_drive_streaming_401(
+        tmp_path, monkeypatch,
+        target_cfg=target_cfg,
+        ambient_key="ambient-key", ambient_url="http://ambient:8000/v1",
+    )
+
+    assert len(constructions) >= 2, (
+        f"expected an initial + a 401-retry AIAgent construction; got {len(constructions)}: {constructions!r}"
+    )
+    # EVERY construction (initial AND retry) must carry the owning profile's
+    # target URL/key — never the ambient sentinel.
+    for i, c in enumerate(constructions):
+        assert c.get("base_url") == "http://target-profile:9000/v1", (
+            f"constructor[{i}] did not use target URL: {c!r}"
+        )
+        assert c.get("api_key") == "target-profile-key", (
+            f"constructor[{i}] did not use target key: {c!r}"
+        )
+        assert c.get("base_url") != "http://ambient:8000/v1", (
+            f"constructor[{i}] leaked ambient URL: {c!r}"
+        )
+        assert c.get("api_key") != "ambient-key", (
+            f"constructor[{i}] leaked ambient key: {c!r}"
+        )
+
+    # Self-heal must invalidate the NAMED custom:<slug> lane (fix #3).
+    assert "custom:worker" in invalidated, (
+        f"self-heal must invalidate the named custom:<slug> identity; got {invalidated!r}"
+    )
+    assert "custom" not in invalidated, (
+        f"self-heal must NOT invalidate the generic collapsed 'custom' lane; got {invalidated!r}"
+    )
+
+
+def test_r5_raised_401_retry_keeps_target_url_key(monkeypatch, tmp_path):
+    """The raised-401 (except-path) self-heal must also rebuild the agent with
+    the owning profile's custom:<slug> URL/key on BOTH the initial and retry
+    AIAgent constructors — an ambient sentinel must never appear, and the
+    self-heal must invalidate the NAMED custom:<slug> identity (#6516 r5)."""
+    target_cfg = {
+        "model": {"default": "worker-model", "provider": "custom:worker",
+                  "base_url": "http://target-profile:9000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://target-profile:9000/v1",
+             "api_key": "target-profile-key"},
+        ],
+    }
+    constructions, invalidated = _r5_drive_streaming_401(
+        tmp_path, monkeypatch,
+        target_cfg=target_cfg,
+        ambient_key="ambient-key", ambient_url="http://ambient:8000/v1",
+        mode="raised",
+    )
+
+    assert len(constructions) >= 2, (
+        f"expected an initial + a raised-401 retry AIAgent construction; got {len(constructions)}: {constructions!r}"
+    )
+    for i, c in enumerate(constructions):
+        assert c.get("base_url") == "http://target-profile:9000/v1", (
+            f"raised-401 constructor[{i}] did not use target URL: {c!r}"
+        )
+        assert c.get("api_key") == "target-profile-key", (
+            f"raised-401 constructor[{i}] did not use target key: {c!r}"
+        )
+        assert c.get("base_url") != "http://ambient:8000/v1", (
+            f"raised-401 constructor[{i}] leaked ambient URL: {c!r}"
+        )
+        assert c.get("api_key") != "ambient-key", (
+            f"raised-401 constructor[{i}] leaked ambient key: {c!r}"
+        )
+
+    # Self-heal must invalidate the NAMED custom:<slug> lane (fix #3).
+    assert "custom:worker" in invalidated, (
+        f"raised-401 self-heal must invalidate the named custom:<slug> identity; got {invalidated!r}"
+    )
+    assert "custom" not in invalidated, (
+        f"raised-401 self-heal must NOT invalidate the generic collapsed 'custom' lane; got {invalidated!r}"
+    )
+
+
+def test_r5_failed_target_config_fails_closed_no_ambient_leak():
+    """When the owning profile's config cannot be established (represented by
+    an empty {} from the fail-closed path in the streaming worker), a truthy
+    ambient URL/key must NOT survive into the resolved bundle — the resolved
+    values are cleared (fail closed) rather than leaking the wrong profile's
+    endpoint (#6516 r5)."""
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker",
+        "ambient-key",
+        "http://ambient:8000/v1",
+        config_data={},
+    )
+    # Fail closed: no ambient key/url (resolved URL/key are cleared); the
+    # provider stays as custom:<slug> since no endpoint authority was resolved
+    # (collapse to 'custom' only happens once a concrete base_url is present).
+    assert url is None, f"expected fail-closed None URL, got {url!r}"
+    assert key is None, f"expected fail-closed None key, got {key!r}"
+    assert provider == "custom:worker", (
+        f"expected provider identity preserved with no endpoint, got {provider!r}"
+    )
+
