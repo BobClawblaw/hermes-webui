@@ -437,56 +437,59 @@ def _apply_profile_home_context_to_streaming_model(
         return model, provider_context, False
 
 
-def _custom_provider_declared_in_config(config_data, provider_id) -> bool:
-    """Return True when *config_data* authoritatively declares the given
-    ``custom:<slug>`` provider (via a ``custom_providers[]`` entry whose name
-    slugifies to the same suffix, or the active model block).
+def _custom_provider_authority_state(
+    config_data: dict | None,
+    provider_id: str,
+    resolved_base_url: str | None,
+) -> str:
+    """Classify target-profile authority for a ``custom:<slug>`` provider.
 
-    Used by ``_resolve_custom_provider_runtime_overrides`` to distinguish a
-    valid target-owned *keyless* configuration (provider is declared, just has
-    no key) from a provider that is *absent* from (or unresolvable in) the
-    target config. In the latter case the target profile is NOT the authority
-    for that provider, so ambient values must not be allowed to leak
-    (#6516 round-5).
+    Returns one of:
+      "unique"    - exactly one target-owned endpoint was pinned (a real
+                    ``base_url`` resolved by the target config), so that URL
+                    and its paired key are the authoritative values to install
+                    as one provenance-coupled bundle.
+      "collision" - multiple slug-equivalent rows with no unique URL winner
+                    (a lossy-slug collision); authority is ambiguous.
+      "absent"    - the provider is not authoritatively declared / no
+                    resolvable endpoint in the target config.
+
+    This replaces the round-5 declaration-only boolean: the target selection
+    is reported as a result that distinguishes one unique row from a
+    collision or absence, so ``_resolve_custom_provider_runtime_overrides``
+    can fail closed instead of retaining ambient credentials (#6516 round-6).
     """
     import api.config as _config_mod
 
-    pid = str(provider_id or "").strip().lower()
-    if not pid.startswith("custom:") or not isinstance(config_data, dict):
-        return False
-    suffix = pid.split(":", 1)[1].strip()
-    if not suffix:
-        return False
-    # Canonicalize the requested suffix through the shared slug helper so
-    # ``custom:foo:bar`` and ``custom:foo-bar`` compare equal.
-    target_slug = _config_mod._custom_provider_slug_from_name(suffix)
-    if not target_slug:
-        # Fall back to the raw suffix (consistency with the resolver).
-        target_slug = suffix
+    # A pinned base_url is the resolver's authoritative "one unique row"
+    # verdict in every path (sole-provider fallback, single slug match, and
+    # the expected-URL-discriminated collision all return a real base_url;
+    # only absent / unresolved-collision return (None, None)).
+    if resolved_base_url:
+        return "unique"
 
-    custom_providers = config_data.get("custom_providers", [])
-    if isinstance(custom_providers, list):
-        for entry in custom_providers:
-            if not isinstance(entry, dict):
-                continue
-            name = str(entry.get("name") or "").strip()
-            if not name:
-                continue
-            entry_slug = _config_mod._custom_provider_slug_from_name(name)
-            if entry_slug and entry_slug == target_slug:
-                return True
-    # Also accept the active model block referencing the provider.
-    model_cfg = config_data.get("model") or {}
-    if isinstance(model_cfg, dict):
-        model_provider = str(model_cfg.get("provider") or "").strip().lower()
-        if model_provider:
-            if model_provider == pid:
-                return True
-            m_suffix = model_provider.split(":", 1)[1] if model_provider.startswith("custom:") else model_provider
-            m_slug = _config_mod._custom_provider_slug_from_name(m_suffix) if m_suffix else ""
-            if m_slug and m_slug == target_slug:
-                return True
-    return False
+    # No endpoint pinned: distinguish an unresolved collision (multiple
+    # slug-equivalent entries) from a simple absence, purely for the
+    # fail-closed path and for regression assertions.
+    pid = str(provider_id or "").strip().lower()
+    suffix = pid.split(":", 1)[1].strip() if pid.startswith("custom:") else ""
+    if suffix and isinstance(config_data, dict):
+        target_slug = _config_mod._custom_provider_slug_from_name(suffix) or suffix
+        custom_providers = config_data.get("custom_providers", [])
+        slug_matches = []
+        if isinstance(custom_providers, list):
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                entry_slug = _config_mod._custom_provider_slug_from_name(name)
+                if entry_slug and entry_slug == target_slug:
+                    slug_matches.append(entry)
+        if len(slug_matches) > 1:
+            return "collision"
+    return "absent"
 
 
 def _resolve_custom_provider_runtime_overrides(
@@ -518,32 +521,25 @@ def _resolve_custom_provider_runtime_overrides(
         resolved_provider, config_data=config_data,
     )
     if config_data is not None:
-        # Target-profile scope is authoritative: the uniquely selected
-        # target-profile URL/key must override any conflicting truthy
-        # runtime values that may have been resolved from the ambient
-        # process-global config (#6516 round-4).
-        if _cp_key:
-            resolved_api_key = _cp_key
-        if _cp_base:
+        # Target-profile scope is a provenance-coupled bundle: clear any
+        # ambient URL/key FIRST, then install exactly what the uniquely
+        # selected target row owns.  A keyless-but-unique target keeps a
+        # None key (the keyless placeholder below is only applied AFTER a
+        # unique endpoint is pinned).  Missing, ambiguous, malformed, or
+        # partial authority must fail closed and must NOT retain an ambient
+        # URL, key, dummy rewrite, or credential-pool result (#6516 round-6).
+        resolved_api_key = None
+        resolved_base_url = None
+        _authority = _custom_provider_authority_state(
+            config_data, resolved_provider, _cp_base,
+        )
+        if _authority == "unique":
+            # Uniquely pinned target endpoint: install its exact URL and
+            # paired key as one bundle.
             resolved_base_url = _cp_base
-        # Fail closed on unresolved target authority (#6516 round-5): when the
-        # target config was supplied but does NOT authoritatively declare this
-        # custom provider (or the owning config could not be established at
-        # all, represented by an empty {}), do NOT let a truthy ambient
-        # URL/key survive into the agent constructor. A keyless but declared
-        # target provider is legitimate — that is handled by the branch above
-        # (its URL/key are None/None, which is the target's own decision).
-        if not (isinstance(config_data, dict) and bool(config_data)):
-            # Owning config load failed ({}) → cannot establish authority.
-            resolved_api_key = None
-            resolved_base_url = None
-        elif not _cp_base and not _cp_key and not _custom_provider_declared_in_config(
-            config_data, resolved_provider
-        ):
-            # Provided target config has no URL and does not declare the
-            # provider → not resolvable here; do not leak ambient values.
-            resolved_api_key = None
-            resolved_base_url = None
+            if _cp_key:
+                resolved_api_key = _cp_key
+        # "collision" / "absent" -> both already None -> fail closed.
     else:
         if not resolved_api_key and _cp_key:
             resolved_api_key = _cp_key

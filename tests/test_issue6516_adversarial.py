@@ -1127,3 +1127,271 @@ def test_r5_failed_target_config_fails_closed_no_ambient_leak():
         f"expected provider identity preserved with no endpoint, got {provider!r}"
     )
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ── Round-6 re-gate (#6516): provenance-coupled target authority ───────────
+# The reviewer required: when config_data is supplied, clear BOTH incoming
+# URL/key first, then install exactly the uniquely selected target URL/key.
+# A keyless-but-unique target may keep a None key (the keyless placeholder is
+# only applied AFTER a unique endpoint is pinned).  Missing / ambiguous /
+# malformed / partial authority must fail closed and must NOT retain an
+# ambient URL, key, dummy rewrite, or credential-pool result.  The old
+# declaration-only boolean conflated "keyless unique" with "collision/absent".
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _r6_keyless_target_cfg():
+    """One unique custom provider with a base_url but NO api_key (deliberately
+    keyless).  The target is authoritative and keyless."""
+    return {
+        "model": {"default": "worker-model", "provider": "custom:worker",
+                  "base_url": "http://worker:9000/v1"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://worker:9000/v1"},
+        ],
+    }
+
+
+def _r6_collision_target_cfg():
+    """Two slug-equivalent custom_providers rows with no discriminating URL.
+    ``worker:prod`` and ``worker-prod`` both slugify to ``custom:worker-prod``,
+    so authority is ambiguous and must fail closed."""
+    return {
+        "model": {"default": "worker-model", "provider": "custom:worker-prod"},
+        "custom_providers": [
+            {"name": "worker:prod", "base_url": "http://prod-a:9000/v1", "api_key": "key-a"},
+            {"name": "worker-prod", "base_url": "http://prod-b:9000/v1", "api_key": "key-b"},
+        ],
+    }
+
+
+# ── Direct unit surface: _resolve_custom_provider_runtime_overrides ───────
+
+
+def test_r6_keyless_target_clears_truthy_ambient_key():
+    """A deliberately keyless target provider must NOT inherit a truthy ambient
+    API key.  The target scope clears the incoming key first, then pins the
+    unique target URL; only the keyless placeholder may follow (never the
+    ambient key)."""
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    target_cfg = _r6_keyless_target_cfg()
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker",
+        "ambient-key",
+        "http://ambient:8000/v1",
+        config_data=target_cfg,
+    )
+    assert url == "http://worker:9000/v1", (
+        f"target unique URL must be installed, got {url!r}"
+    )
+    # The ambient key must NOT survive; a unique endpoint is pinned so the
+    # keyless placeholder may be used.
+    assert key != "ambient-key", (
+        f"ambient key leaked into a keyless target bundle: {key!r}"
+    )
+    assert key == "dummy-key", (
+        f"keyless placeholder expected after unique endpoint pinned, got {key!r}"
+    )
+    assert provider == "custom", (
+        f"expected collapsed 'custom' once a unique endpoint is set, got {provider!r}"
+    )
+
+
+def test_r6_absent_provider_fails_closed_no_ambient_leak():
+    """A provider absent from the target config must clear a truthy ambient
+    URL/key (fail closed) — no endpoint authority, no placeholder, identity
+    preserved as custom:<slug>."""
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    # Two unrelated custom providers disables the sole-provider fallback, so a
+    # genuinely absent provider resolves to (None, None) and must fail closed.
+    target_cfg = {"model": {"default": "other-model", "provider": "openai"},
+                  "custom_providers": [
+                      {"name": "unrelated-a", "base_url": "http://other-a:9000/v1",
+                       "api_key": "key-a"},
+                      {"name": "unrelated-b", "base_url": "http://other-b:9000/v1",
+                       "api_key": "key-b"},
+                  ]}
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:ghost",
+        "ambient-key",
+        "http://ambient:8000/v1",
+        config_data=target_cfg,
+    )
+    assert url is None, f"absent provider must fail closed (None URL), got {url!r}"
+    assert key is None, f"absent provider must fail closed (None key), got {key!r}"
+    assert provider == "custom:ghost", (
+        f"no endpoint -> identity preserved, got {provider!r}"
+    )
+
+
+def test_r6_slug_collision_clears_truthy_ambient_keyurl():
+    """An unresolved lossy-slug collision must fail closed and clear BOTH a
+    truthy ambient URL and key — the old code left them in place because
+    _custom_provider_declared_in_config returned True on the first slug
+    match."""
+    from api.streaming import _resolve_custom_provider_runtime_overrides
+
+    target_cfg = _r6_collision_target_cfg()
+    provider, key, url = _resolve_custom_provider_runtime_overrides(
+        "custom:worker-prod",
+        "ambient-key",
+        "http://ambient:8000/v1",
+        config_data=target_cfg,
+    )
+    # Ambiguous authority -> fail closed: NO ambient values may survive, and
+    # no dummy rewrite may be inserted (no unique endpoint was pinned).
+    assert url is None, f"collision must fail closed (None URL), got {url!r}"
+    assert key is None, f"collision must fail closed (None key), got {key!r}"
+    assert provider == "custom:worker-prod", (
+        f"no endpoint -> identity preserved, got {provider!r}"
+    )
+
+
+def test_r6_authority_state_classification():
+    """The new selection result distinguishes unique / collision / absent."""
+    import api.streaming as streaming
+
+    keyless_cfg = _r6_keyless_target_cfg()
+    collision_cfg = _r6_collision_target_cfg()
+
+    # Unique: resolver pinned a real base_url.
+    state = streaming._custom_provider_authority_state(
+        keyless_cfg, "custom:worker", "http://worker:9000/v1",
+    )
+    assert state == "unique", f"expected unique, got {state!r}"
+
+    # Unique resolves via base_url presence regardless of key.
+    state = streaming._custom_provider_authority_state(
+        keyless_cfg, "custom:worker", "http://worker:9000/v1",
+    )
+    assert state == "unique"
+
+    # Collision: two slug-equivalent rows, no pinned URL.
+    state = streaming._custom_provider_authority_state(
+        collision_cfg, "custom:worker-prod", None,
+    )
+    assert state == "collision", f"expected collision, got {state!r}"
+
+    # Absent: not declared anywhere, no URL.
+    state = streaming._custom_provider_authority_state(
+        {"custom_providers": []}, "custom:ghost", None,
+    )
+    assert state == "absent", f"expected absent, got {state!r}"
+
+
+# ── Production-composed: initial + 401 self-heal retry paths ──────────────
+
+
+def test_r6_keyless_target_initial_and_returned_401_no_ambient_leak(monkeypatch, tmp_path):
+    """End-to-end initial send + returned-401 retry for a KEYLESS target: the
+    ambient key sentinel must never reach ANY AIAgent constructor; the keyless
+    placeholder (applied only after the unique endpoint is pinned) is what the
+    constructors see."""
+    constructions, _ = _r5_drive_streaming_401(
+        tmp_path, monkeypatch,
+        target_cfg=_r6_keyless_target_cfg(),
+        ambient_key="ambient-key", ambient_url="http://ambient:8000/v1",
+        mode="returned",
+    )
+    assert len(constructions) >= 2, (
+        f"expected initial + retry constructions, got {len(constructions)}: {constructions!r}"
+    )
+    for i, c in enumerate(constructions):
+        assert c.get("api_key") != "ambient-key", (
+            f"constructor[{i}] leaked ambient key into keyless target: {c!r}"
+        )
+        assert c.get("base_url") == "http://worker:9000/v1", (
+            f"constructor[{i}] did not use the unique target URL: {c!r}"
+        )
+        # A unique endpoint is pinned and the target is keyless -> placeholder.
+        assert c.get("api_key") == "dummy-key", (
+            f"constructor[{i}] expected keyless placeholder, got {c.get('api_key')!r}"
+        )
+
+
+def test_r6_keyless_target_raised_401_no_ambient_leak(monkeypatch, tmp_path):
+    """Same as above but through the raised-401 (except-path) self-heal."""
+    constructions, _ = _r5_drive_streaming_401(
+        tmp_path, monkeypatch,
+        target_cfg=_r6_keyless_target_cfg(),
+        ambient_key="ambient-key", ambient_url="http://ambient:8000/v1",
+        mode="raised",
+    )
+    assert len(constructions) >= 2, (
+        f"expected initial + retry constructions, got {len(constructions)}: {constructions!r}"
+    )
+    for i, c in enumerate(constructions):
+        assert c.get("api_key") != "ambient-key", (
+            f"raised-401 constructor[{i}] leaked ambient key: {c!r}"
+        )
+        assert c.get("base_url") == "http://worker:9000/v1", (
+            f"raised-401 constructor[{i}] did not use target URL: {c!r}"
+        )
+        assert c.get("api_key") == "dummy-key", (
+            f"raised-401 constructor[{i}] expected keyless placeholder, got {c.get('api_key')!r}"
+        )
+
+
+def test_r6_keyless_target_returned_401_invalidates_named_lane(monkeypatch, tmp_path):
+    """Self-heal on a keyless target still invalidates the NAMED custom:<slug>
+    lane (not the generic 'custom' collapse)."""
+    constructions, invalidated = _r5_drive_streaming_401(
+        tmp_path, monkeypatch,
+        target_cfg=_r6_keyless_target_cfg(),
+        ambient_key="ambient-key", ambient_url="http://ambient:8000/v1",
+        mode="returned",
+    )
+    assert len(constructions) >= 2
+    assert "custom:worker" in invalidated, (
+        f"must invalidate the named custom:worker lane; got {invalidated!r}"
+    )
+    assert "custom" not in invalidated, (
+        f"must NOT invalidate the generic 'custom' collapse; got {invalidated!r}"
+    )
+
+
+def _r6_collision_on_worker_target_cfg():
+    """Two slug-equivalent rows that BOTH slugify to ``custom:worker``
+    (the provider the composed harness hardcodes): ``worker`` and ``worker!``.
+    No discriminating URL -> ambiguous authority must fail closed."""
+    return {
+        "model": {"default": "worker-model", "provider": "custom:worker"},
+        "custom_providers": [
+            {"name": "worker", "base_url": "http://prod-a:9000/v1", "api_key": "key-a"},
+            {"name": "worker!", "base_url": "http://prod-b:9000/v1", "api_key": "key-b"},
+        ],
+    }
+
+
+def test_r6_collision_initial_and_returned_401_no_ambient_leak(monkeypatch, tmp_path):
+    """End-to-end for an unresolved slug collision: the ambient URL/key
+    sentinels must never reach ANY AIAgent constructor — authority is
+    ambiguous so the bundle fails closed (no URL, no key, no placeholder)."""
+    target_cfg = _r6_collision_on_worker_target_cfg()
+    constructions, _ = _r5_drive_streaming_401(
+        tmp_path, monkeypatch,
+        target_cfg=target_cfg,
+        ambient_key="ambient-key", ambient_url="http://ambient:8000/v1",
+        mode="returned",
+    )
+    assert len(constructions) >= 2, (
+        f"expected initial + retry constructions, got {len(constructions)}: {constructions!r}"
+    )
+    for i, c in enumerate(constructions):
+        assert c.get("api_key") != "ambient-key", (
+            f"collision constructor[{i}] leaked ambient key: {c!r}"
+        )
+        assert c.get("base_url") != "http://ambient:8000/v1", (
+            f"collision constructor[{i}] leaked ambient URL: {c!r}"
+        )
+        # Fail closed: no colliding row may win, and no placeholder may be
+        # inserted because no unique endpoint was pinned.
+        assert c.get("api_key") is None, (
+            f"collision constructor[{i}] must fail closed (None key), got {c.get('api_key')!r}"
+        )
+        assert c.get("base_url") is None, (
+            f"collision constructor[{i}] must fail closed (None base_url), got {c.get('base_url')!r}"
+        )
